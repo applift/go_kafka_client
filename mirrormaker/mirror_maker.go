@@ -22,6 +22,11 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"time"
+	"net"
+	"log"
+
+	metrics "github.com/rcrowley/go-metrics"
 )
 
 type consumerConfigs []string
@@ -48,6 +53,9 @@ var queueSize = flag.Int("queue.size", 10000, "Number of messages that are buffe
 var maxProcs = flag.Int("max.procs", runtime.NumCPU(), "Maximum number of CPUs that can be executing simultaneously.")
 var schemaRegistryUrl = flag.String("schema.registry.url", "", "Avro schema registry URL for message encoding/decoding")
 var timingsProducerConfig = flag.String("timings.producer.config", "", "Path to producer configuration file for timings.")
+var graphiteConnect = flag.String("graphite.connect", "", "IP and Port of Graphite Instance.")
+var graphiteFlush = flag.String("graphite.flush", "10s", "Graphite Flush interval. Default: 10s")
+var graphitePrefix = flag.String("graphite.prefix", "mirrormaker", "Graphite Prefix key. Default: mirrormaker")
 
 func parseAndValidateArgs() *kafka.MirrorMakerConfig {
 	flag.Var(&consumerConfig, "consumer.config", "Path to consumer configuration file.")
@@ -98,11 +106,45 @@ func parseAndValidateArgs() *kafka.MirrorMakerConfig {
 
 func main() {
 	config := parseAndValidateArgs()
+
+	if *graphiteConnect != "" {
+		flushTime, _ := time.ParseDuration(*graphiteFlush)
+		startMetrics(*graphiteConnect, flushTime, *graphitePrefix)
+	}
+
+	config.ConsumerStrategy = GetStrategy(config.Consumerid)
 	mirrorMaker := kafka.NewMirrorMaker(config)
+
 	go mirrorMaker.Start()
 
 	ctrlc := make(chan os.Signal, 1)
 	signal.Notify(ctrlc, os.Interrupt)
 	<-ctrlc
 	mirrorMaker.Stop()
+}
+
+func startMetrics(connect string, flush time.Duration, prefix string) {
+	kafka.Infof("metrics", "Send metrics to: %s", connect)
+	addr, err := net.ResolveTCPAddr("tcp", connect)
+	if err != nil {
+		panic(err)
+	}
+	go metrics.GraphiteWithConfig(metrics.GraphiteConfig{
+		Addr:          addr,
+		Registry:      metrics.DefaultRegistry,
+		FlushInterval: flush,
+		DurationUnit:  time.Second,
+		Prefix:        prefix,
+		Percentiles:   []float64{0.5, 0.75, 0.95, 0.99, 0.999},
+	})
+}
+
+func GetStrategy(consumerId string) func(*kafkaClient.Worker, *kafkaClient.Message, kafkaClient.TaskId) kafkaClient.WorkerResult {
+	consumeRate := metrics.NewRegisteredMeter(fmt.Sprintf("%s-ConsumeRate", consumerId), metrics.DefaultRegistry)
+	return func(_ *kafkaClient.Worker, msg *kafkaClient.Message, id kafkaClient.TaskId) kafkaClient.WorkerResult {
+		kafkaClient.Infof("main", "Got a message: %s", string(msg.Value))
+		consumeRate.Mark(1)
+
+		return kafkaClient.NewSuccessfulResult(id)
+	}
 }

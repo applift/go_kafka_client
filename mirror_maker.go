@@ -75,6 +75,11 @@ type MirrorMakerConfig struct {
 	// Defines whether add timings to message or not.
 	// Note: used only for avro encoded messages
 	TimingsProducerConfig string
+
+	// A function which defines a user-specified action on a single message. This function is responsible for actual message processing.
+	ConsumerStrategy WorkerStrategy
+	ProducerStrategy WorkerStrategy
+
 }
 
 // Creates an empty MirrorMakerConfig.
