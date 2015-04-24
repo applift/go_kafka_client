@@ -18,15 +18,19 @@ package main
 import (
 	"flag"
 	"fmt"
-	kafka "github.com/stealthly/go_kafka_client"
 	"os"
 	"os/signal"
 	"runtime"
 	"time"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"log"
 
-	metrics "github.com/rcrowley/go-metrics"
+	metrics    "github.com/rcrowley/go-metrics"
+	prometheus "github.com/prometheus/client_golang/prometheus"
+
+	kafka "github.com/stealthly/go_kafka_client"
 )
 
 type consumerConfigs []string
@@ -39,6 +43,22 @@ func (i *consumerConfigs) Set(value string) error {
 	*i = append(*i, value)
 	return nil
 }
+
+var (
+	indexed = prometheus.NewCounter(prometheus.CounterOpts{
+				Namespace: "my_company",
+				Subsystem: "indexer",
+				Name:      "documents_indexed",
+				Help:      "The number of documents indexed.",
+				})
+	size    = prometheus.NewGauge(prometheus.GaugeOpts{
+				Namespace: "my_company",
+				Subsystem: "storage",
+				Name:      "documents_total_size_bytes",
+				Help:      "The total size of all documents in the storage.",
+				})
+)
+
 
 var whitelist = flag.String("whitelist", "", "regex pattern for whitelist. Providing both whitelist and blacklist is an error.")
 var blacklist = flag.String("blacklist", "", "regex pattern for blacklist. Providing both whitelist and blacklist is an error.")
@@ -56,6 +76,7 @@ var timingsProducerConfig = flag.String("timings.producer.config", "", "Path to 
 var graphiteConnect = flag.String("graphite.connect", "", "IP and Port of Graphite Instance.")
 var graphiteFlush = flag.String("graphite.flush", "10s", "Graphite Flush interval. Default: 10s")
 var graphitePrefix = flag.String("graphite.prefix", "mirrormaker", "Graphite Prefix key. Default: mirrormaker")
+var prometheusAddr = flag.String("prometheus.address", "", "The address to listen on for HTTP requests.")
 
 func parseAndValidateArgs() *kafka.MirrorMakerConfig {
 	flag.Var(&consumerConfig, "consumer.config", "Path to consumer configuration file.")
@@ -112,7 +133,17 @@ func main() {
 		startMetrics(*graphiteConnect, flushTime, *graphitePrefix)
 	}
 
-	config.ConsumerStrategy = GetStrategy(config.Consumerid)
+	if *prometheusAddr != "" {
+		go func() {
+			http.Handle("/metrics", prometheus.Handler())
+			log.Println(http.ListenAndServe(*prometheusAddr, nil))
+		}()
+
+		indexed.Inc()
+		size.Set(5)
+	}
+
+	//config.ConsumerStrategy = GetStrategy(config.Consumerid)
 	mirrorMaker := kafka.NewMirrorMaker(config)
 
 	go mirrorMaker.Start()
@@ -139,12 +170,17 @@ func startMetrics(connect string, flush time.Duration, prefix string) {
 	})
 }
 
-func GetStrategy(consumerId string) func(*kafkaClient.Worker, *kafkaClient.Message, kafkaClient.TaskId) kafkaClient.WorkerResult {
+func GetStrategy(consumerId string) func(*kafka.Worker, *kafka.Message, kafka.TaskId) kafka.WorkerResult {
 	consumeRate := metrics.NewRegisteredMeter(fmt.Sprintf("%s-ConsumeRate", consumerId), metrics.DefaultRegistry)
-	return func(_ *kafkaClient.Worker, msg *kafkaClient.Message, id kafkaClient.TaskId) kafkaClient.WorkerResult {
-		kafkaClient.Infof("main", "Got a message: %s", string(msg.Value))
+	return func(_ *kafka.Worker, msg *kafka.Message, id kafka.TaskId) kafka.WorkerResult {
+		kafka.Infof("main", "Got a message: %s", string(msg.Value))
 		consumeRate.Mark(1)
 
-		return kafkaClient.NewSuccessfulResult(id)
+		return kafka.NewSuccessfulResult(id)
 	}
+}
+
+func init() {
+	prometheus.MustRegister(indexed)
+	prometheus.MustRegister(size)
 }
