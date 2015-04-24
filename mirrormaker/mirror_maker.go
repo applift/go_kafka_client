@@ -18,17 +18,17 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
 	"time"
-	"net"
-	"net/http"
-	_ "net/http/pprof"
-	"log"
 
-	metrics    "github.com/rcrowley/go-metrics"
 	prometheus "github.com/prometheus/client_golang/prometheus"
+	metrics "github.com/rcrowley/go-metrics"
 
 	kafka "github.com/stealthly/go_kafka_client"
 )
@@ -45,20 +45,37 @@ func (i *consumerConfigs) Set(value string) error {
 }
 
 var (
-	indexed = prometheus.NewCounter(prometheus.CounterOpts{
-				Namespace: "my_company",
-				Subsystem: "indexer",
-				Name:      "documents_indexed",
-				Help:      "The number of documents indexed.",
-				})
-	size    = prometheus.NewGauge(prometheus.GaugeOpts{
-				Namespace: "my_company",
-				Subsystem: "storage",
-				Name:      "documents_total_size_bytes",
-				Help:      "The total size of all documents in the storage.",
-				})
+	msg_read = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "mirrormaker",
+		Subsystem: "indexer",
+		Name:      "msg_read",
+		Help:      "The number of messages read.",
+	})
+	queue_size = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "mirrormaker",
+		Subsystem: "queue",
+		Name:      "queue_size",
+		Help:      "The number of messages in queue.",
+	})
+	msg_sent = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "mirrormaker",
+		Subsystem: "indexer",
+		Name:      "msg_sent",
+		Help:      "The number of messages sent.",
+	})
+	num_streams = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "mirrormaker",
+		Subsystem: "indexer",
+		Name:      "num_streams",
+		Help:      "The number of streams.",
+	})
+	num_producers = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "mirrormaker",
+		Subsystem: "indexer",
+		Name:      "num_producers",
+		Help:      "The number of producers.",
+	})
 )
-
 
 var whitelist = flag.String("whitelist", "", "regex pattern for whitelist. Providing both whitelist and blacklist is an error.")
 var blacklist = flag.String("blacklist", "", "regex pattern for blacklist. Providing both whitelist and blacklist is an error.")
@@ -71,8 +88,6 @@ var preserveOrder = flag.Bool("preserve.order", false, "E.g. message sequence 1,
 var prefix = flag.String("prefix", "", "Destination topic prefix.")
 var queueSize = flag.Int("queue.size", 10000, "Number of messages that are buffered between the consumer and producer.")
 var maxProcs = flag.Int("max.procs", runtime.NumCPU(), "Maximum number of CPUs that can be executing simultaneously.")
-var schemaRegistryUrl = flag.String("schema.registry.url", "", "Avro schema registry URL for message encoding/decoding")
-var timingsProducerConfig = flag.String("timings.producer.config", "", "Path to producer configuration file for timings.")
 var graphiteConnect = flag.String("graphite.connect", "", "IP and Port of Graphite Instance.")
 var graphiteFlush = flag.String("graphite.flush", "10s", "Graphite Flush interval. Default: 10s")
 var graphitePrefix = flag.String("graphite.prefix", "mirrormaker", "Graphite Prefix key. Default: mirrormaker")
@@ -99,9 +114,6 @@ func parseAndValidateArgs() *kafka.MirrorMakerConfig {
 		fmt.Println("Queue size should be equal or greater than 0")
 		os.Exit(1)
 	}
-	if *timingsProducerConfig == "" && *schemaRegistryUrl == "" {
-		fmt.Println("--schema.registry.url parameter is required when --timings is used")
-	}
 
 	config := kafka.NewMirrorMakerConfig()
 	config.Blacklist = *blacklist
@@ -114,13 +126,6 @@ func parseAndValidateArgs() *kafka.MirrorMakerConfig {
 	config.PreserveOrder = *preserveOrder
 	config.ProducerConfig = *producerConfig
 	config.TopicPrefix = *prefix
-	if *schemaRegistryUrl != "" {
-		config.KeyEncoder = kafka.NewKafkaAvroEncoder(*schemaRegistryUrl)
-		config.ValueEncoder = kafka.NewKafkaAvroEncoder(*schemaRegistryUrl)
-		config.KeyDecoder = kafka.NewKafkaAvroDecoder(*schemaRegistryUrl)
-		config.ValueDecoder = kafka.NewKafkaAvroDecoder(*schemaRegistryUrl)
-	}
-	config.TimingsProducerConfig = *timingsProducerConfig
 
 	return config
 }
@@ -139,11 +144,18 @@ func main() {
 			log.Println(http.ListenAndServe(*prometheusAddr, nil))
 		}()
 
-		indexed.Inc()
-		size.Set(5)
+		num_streams.Set(float64(config.NumStreams))
+		num_producers.Set(float64(config.NumProducers))
+
+		successHook := func(msg *kafka.ProducerMessage) {
+			kafka.Infof("producer", "Send msg to: %s", msg.Topic)
+			msg_sent.Inc()
+			queue_size.Dec()
+		}
+
+		config.ProducerSuccessCallbacks = append(config.ProducerSuccessCallbacks, successHook)
 	}
 
-	//config.ConsumerStrategy = GetStrategy(config.Consumerid)
 	mirrorMaker := kafka.NewMirrorMaker(config)
 
 	go mirrorMaker.Start()
@@ -181,6 +193,9 @@ func GetStrategy(consumerId string) func(*kafka.Worker, *kafka.Message, kafka.Ta
 }
 
 func init() {
-	prometheus.MustRegister(indexed)
-	prometheus.MustRegister(size)
+	prometheus.MustRegister(msg_read)
+	prometheus.MustRegister(msg_sent)
+	prometheus.MustRegister(queue_size)
+	prometheus.MustRegister(num_streams)
+	prometheus.MustRegister(num_producers)
 }

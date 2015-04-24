@@ -24,6 +24,8 @@ import (
 	"time"
 )
 
+type ProducerCallback func(msg *ProducerMessage)
+
 // MirrorMakerConfig defines configuration options for MirrorMaker
 type MirrorMakerConfig struct {
 	// Whitelist of topics to mirror. Exactly one whitelist or blacklist is allowed.
@@ -71,15 +73,13 @@ type MirrorMakerConfig struct {
 	// Function that generates producer instances
 	ProducerConstructor ProducerConstructor
 
+	// TODOD: Extract to more specific place
 	// Path to producer configuration, that is responsible for logging timings
 	// Defines whether add timings to message or not.
 	// Note: used only for avro encoded messages
 	TimingsProducerConfig string
 
-	// A function which defines a user-specified action on a single message. This function is responsible for actual message processing.
-	ConsumerStrategy WorkerStrategy
-	ProducerStrategy WorkerStrategy
-
+	ProducerSuccessCallbacks []ProducerCallback
 }
 
 // Creates an empty MirrorMakerConfig.
@@ -114,10 +114,10 @@ func NewMirrorMaker(config *MirrorMakerConfig) *MirrorMaker {
 		logLineSchema = readLoglineSchema()
 	}
 	return &MirrorMaker{
-		config:      config,
+		config:        config,
 		logLineSchema: logLineSchema,
-		evolutioned: newSchemaSet(),
-		errors:      make(chan *FailedMessage),
+		evolutioned:   newSchemaSet(),
+		errors:        make(chan *FailedMessage),
 	}
 }
 
@@ -251,9 +251,11 @@ func (this *MirrorMaker) startProducers() {
 		}
 		producer := this.config.ProducerConstructor(conf)
 		this.producers = append(this.producers, producer)
-		if this.config.TimingsProducerConfig != "" {
-			go this.timingsRoutine(producer)
+
+		if len(this.config.ProducerSuccessCallbacks) > 0 {
+			go this.successRoutine(producer)
 		}
+
 		go this.failedRoutine(producer)
 		if this.config.PreserveOrder {
 			go this.produceRoutine(producer, i)
@@ -266,14 +268,6 @@ func (this *MirrorMaker) startProducers() {
 func (this *MirrorMaker) produceRoutine(producer Producer, channelIndex int) {
 	partitionEncoder := &Int32Encoder{}
 	for msg := range this.messageChannels[channelIndex] {
-		if this.config.TimingsProducerConfig != "" {
-			preProduce := time.Now().UnixNano()
-			if record, ok := msg.DecodedValue.(*avro.GenericRecord); ok {
-				msg.DecodedValue = this.AddTiming(record, "pre-produce", preProduce)
-			} else {
-				panic("Failed to decode message")
-			}
-		}
 		if this.config.PreservePartitions {
 			producer.Input() <- &ProducerMessage{Topic: this.config.TopicPrefix + msg.Topic, Key: uint32(msg.Partition), Value: msg.DecodedValue, KeyEncoder: partitionEncoder}
 		} else {
@@ -282,33 +276,10 @@ func (this *MirrorMaker) produceRoutine(producer Producer, channelIndex int) {
 	}
 }
 
-func (this *MirrorMaker) timingsRoutine(producer Producer) {
-	var keyDecoder Decoder
-	if this.config.PreservePartitions {
-		keyDecoder = &Int32Decoder{}
-	} else {
-		keyDecoder = this.config.KeyDecoder
-	}
-
+func (this *MirrorMaker) successRoutine(producer Producer) {
 	for msg := range producer.Successes() {
-		decodedKey, err := keyDecoder.Decode(msg.Key.([]byte))
-		if err != nil {
-			Errorf(this, "Failed to decode %v", msg.Key)
-		}
-		decodedValue, err := this.config.ValueDecoder.Decode(msg.Value.([]byte))
-		if err != nil {
-			Errorf(this, "Failed to decode %v", msg.Value)
-		}
-
-		if record, ok := decodedValue.(*avro.GenericRecord); ok {
-			record = this.AddTiming(record, "post-produce", time.Now().Unix())
-			if this.config.PreservePartitions {
-				this.timingsProducer.Input() <- &ProducerMessage{Topic: "timings_" + msg.Topic, Key: int32(decodedKey.(uint32)), Value: record}
-			} else {
-				this.timingsProducer.Input() <- &ProducerMessage{Topic: "timings_" + msg.Topic, Key: decodedKey, Value: record}
-			}
-		} else {
-			Errorf(this, "Invalid avro schema type %s", decodedValue)
+		for _, hook := range this.config.ProducerSuccessCallbacks {
+			hook(msg)
 		}
 	}
 }
