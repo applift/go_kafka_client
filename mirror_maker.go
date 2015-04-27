@@ -17,11 +17,7 @@ package go_kafka_client
 
 import (
 	"fmt"
-	avro "github.com/stealthly/go-avro"
 	"hash/fnv"
-	"io/ioutil"
-	"reflect"
-	"time"
 )
 
 type ProducerCallback func(msg *ProducerMessage)
@@ -73,12 +69,6 @@ type MirrorMakerConfig struct {
 	// Function that generates producer instances
 	ProducerConstructor ProducerConstructor
 
-	// TODOD: Extract to more specific place
-	// Path to producer configuration, that is responsible for logging timings
-	// Defines whether add timings to message or not.
-	// Note: used only for avro encoded messages
-	TimingsProducerConfig string
-
 	ProducerSuccessCallbacks []ProducerCallback
 }
 
@@ -90,7 +80,6 @@ func NewMirrorMakerConfig() *MirrorMakerConfig {
 		KeyDecoder:            &ByteDecoder{},
 		ValueDecoder:          &ByteDecoder{},
 		ProducerConstructor:   NewSaramaProducer,
-		TimingsProducerConfig: "",
 	}
 }
 
@@ -102,20 +91,14 @@ type MirrorMaker struct {
 	producers       []Producer
 	messageChannels []chan *Message
 	timingsProducer Producer
-	logLineSchema   *avro.RecordSchema
 	evolutioned     *schemaSet
 	errors          chan *FailedMessage
 }
 
 // Creates a new MirrorMaker using given MirrorMakerConfig.
 func NewMirrorMaker(config *MirrorMakerConfig) *MirrorMaker {
-	var logLineSchema *avro.RecordSchema
-	if config.TimingsProducerConfig != "" {
-		logLineSchema = readLoglineSchema()
-	}
 	return &MirrorMaker{
 		config:        config,
-		logLineSchema: logLineSchema,
 		evolutioned:   newSchemaSet(),
 		errors:        make(chan *FailedMessage),
 	}
@@ -174,15 +157,6 @@ func (this *MirrorMaker) startConsumers() {
 		if this.config.PreserveOrder {
 			numProducers := this.config.NumProducers
 			config.Strategy = func(_ *Worker, msg *Message, id TaskId) WorkerResult {
-				if this.config.TimingsProducerConfig != "" {
-					consumed := time.Now().Unix()
-					if record, ok := msg.DecodedValue.(*avro.GenericRecord); ok {
-						msg.DecodedValue = this.AddTiming(record, "consumed", consumed)
-					} else {
-						return NewProcessingFailedResult(id)
-					}
-				}
-
 				this.messageChannels[topicPartitionHash(msg)%numProducers] <- msg
 
 				return NewSuccessfulResult(id)
@@ -218,22 +192,6 @@ func (this *MirrorMaker) initializeMessageChannels() {
 }
 
 func (this *MirrorMaker) startProducers() {
-	if this.config.TimingsProducerConfig != "" {
-		conf, err := ProducerConfigFromFile(this.config.TimingsProducerConfig)
-		if err != nil {
-			panic(err)
-		}
-		if this.config.PreservePartitions {
-			conf.Partitioner = NewFixedPartitioner
-		} else {
-			conf.Partitioner = NewRandomPartitioner
-		}
-		conf.KeyEncoder = this.config.KeyEncoder
-		conf.ValueEncoder = this.config.ValueEncoder
-		this.timingsProducer = this.config.ProducerConstructor(conf)
-		go this.failedRoutine(this.timingsProducer)
-	}
-
 	for i := 0; i < this.config.NumProducers; i++ {
 		conf, err := ProducerConfigFromFile(this.config.ProducerConfig)
 		if err != nil {
@@ -244,11 +202,9 @@ func (this *MirrorMaker) startProducers() {
 		} else {
 			conf.Partitioner = NewRandomPartitioner
 		}
+		conf.AckSuccesses = true
 		conf.KeyEncoder = this.config.KeyEncoder
 		conf.ValueEncoder = this.config.ValueEncoder
-		if this.config.TimingsProducerConfig != "" {
-			conf.AckSuccesses = true
-		}
 		producer := this.config.ProducerConstructor(conf)
 		this.producers = append(this.producers, producer)
 
@@ -284,57 +240,8 @@ func (this *MirrorMaker) successRoutine(producer Producer) {
 	}
 }
 
-func (this *MirrorMaker) AddTiming(record *avro.GenericRecord, tag string, now int64) *avro.GenericRecord {
-	if !this.evolutioned.exists(record.Schema().String()) {
-		currentSchema := record.Schema().(*avro.RecordSchema)
-		newSchema := *record.Schema().(*avro.RecordSchema)
-		for _, newField := range this.logLineSchema.Fields {
-			var exists bool
-			for _, currentField := range currentSchema.Fields {
-				if currentField.Name == newField.Name {
-					if reflect.DeepEqual(currentField, newField) {
-						exists = true
-						break
-					}
-					panic(fmt.Sprintf("Incompatible field %s in schema %s", currentField.Name, currentSchema.String()))
-				}
-			}
-			if !exists {
-				newSchema.Fields = append(newSchema.Fields, newField)
-			}
-		}
-		newRecord := avro.NewGenericRecord(&newSchema)
-		for _, field := range currentSchema.Fields {
-			newRecord.Set(field.Name, record.Get(field.Name))
-		}
-		record = newRecord
-		this.evolutioned.add(record.Schema().String())
-	}
-
-	var timings map[string]interface{}
-	if record.Get("timings") == nil {
-		timings = make(map[string]interface{})
-	} else {
-		timings = record.Get("timings").(map[string]interface{})
-	}
-
-	timings[tag] = now
-	record.Set("timings", timings)
-
-	return record
-}
-
 func (this *MirrorMaker) Errors() <-chan *FailedMessage {
 	return this.errors
-}
-
-func readLoglineSchema() *avro.RecordSchema {
-	file, err := ioutil.ReadFile("logline.avsc")
-	if err != nil {
-		panic(err)
-	}
-
-	return avro.MustParseSchema(string(file)).(*avro.RecordSchema)
 }
 
 func (this *MirrorMaker) failedRoutine(producer Producer) {

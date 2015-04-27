@@ -142,6 +142,7 @@ func ProducerConfigFromFile(filename string) (*ProducerConfig, error) {
 		return nil, err
 	}
 
+	config.AckSuccesses = (config.Acks > 0)
 	return config, nil
 }
 

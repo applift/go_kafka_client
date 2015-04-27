@@ -139,6 +139,7 @@ func main() {
 	}
 
 	if *prometheusAddr != "" {
+		kafka.Infof("mirrormaker", "Start metrics for prometheius")
 		go func() {
 			http.Handle("/metrics", prometheus.Handler())
 			log.Println(http.ListenAndServe(*prometheusAddr, nil))
@@ -148,7 +149,6 @@ func main() {
 		num_producers.Set(float64(config.NumProducers))
 
 		successHook := func(msg *kafka.ProducerMessage) {
-			kafka.Infof("producer", "Send msg to: %s", msg.Topic)
 			msg_sent.Inc()
 			queue_size.Dec()
 		}
