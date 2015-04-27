@@ -21,6 +21,7 @@ import (
 )
 
 type ProducerCallback func(msg *ProducerMessage)
+type ConsumerCallback func(msg *Message)
 
 // MirrorMakerConfig defines configuration options for MirrorMaker
 type MirrorMakerConfig struct {
@@ -70,6 +71,7 @@ type MirrorMakerConfig struct {
 	ProducerConstructor ProducerConstructor
 
 	ProducerSuccessCallbacks []ProducerCallback
+	ConsumerReadMsgCallbacks []ConsumerCallback
 }
 
 // Creates an empty MirrorMakerConfig.
@@ -151,20 +153,22 @@ func (this *MirrorMaker) startConsumers() {
 		config.WorkerFailureCallback = func(_ *WorkerManager) FailedDecision {
 			return CommitOffsetAndContinue
 		}
+
 		config.WorkerFailedAttemptCallback = func(_ *Task, _ WorkerResult) FailedDecision {
 			return CommitOffsetAndContinue
 		}
+
 		if this.config.PreserveOrder {
 			numProducers := this.config.NumProducers
 			config.Strategy = func(_ *Worker, msg *Message, id TaskId) WorkerResult {
 				this.messageChannels[topicPartitionHash(msg)%numProducers] <- msg
-
+				go this.onReadSuccessCallbacks(msg)
 				return NewSuccessfulResult(id)
 			}
 		} else {
 			config.Strategy = func(_ *Worker, msg *Message, id TaskId) WorkerResult {
 				this.messageChannels[0] <- msg
-
+				go this.onReadSuccessCallbacks(msg)
 				return NewSuccessfulResult(id)
 			}
 		}
@@ -237,6 +241,12 @@ func (this *MirrorMaker) successRoutine(producer Producer) {
 		for _, hook := range this.config.ProducerSuccessCallbacks {
 			hook(msg)
 		}
+	}
+}
+
+func (this *MirrorMaker) onReadSuccessCallbacks(msg *Message) {
+	for _, hook := range this.config.ConsumerReadMsgCallbacks {
+		hook(msg)
 	}
 }
 

@@ -148,12 +148,18 @@ func main() {
 		num_streams.Set(float64(config.NumStreams))
 		num_producers.Set(float64(config.NumProducers))
 
-		successHook := func(msg *kafka.ProducerMessage) {
+		pSuccessHook := func(msg *kafka.ProducerMessage) {
 			msg_sent.Inc()
 			queue_size.Dec()
 		}
 
-		config.ProducerSuccessCallbacks = append(config.ProducerSuccessCallbacks, successHook)
+		cReadHook := func(msg *kafka.Message) {
+			msg_read.Inc()
+			queue_size.Inc()
+		}
+
+		config.ProducerSuccessCallbacks = append(config.ProducerSuccessCallbacks, pSuccessHook)
+		config.ConsumerReadMsgCallbacks = append(config.ConsumerReadMsgCallbacks, cReadHook)
 	}
 
 	mirrorMaker := kafka.NewMirrorMaker(config)
